@@ -20,6 +20,8 @@ package util
 type DeviceUtil interface {
 	FindMultipathDeviceForDevice(disk string) string
 	FindSlaveDevicesOnMultipath(disk string) []string
+	FindScsiHostsForTarget(targetIqn string, portals []string) (map[int]int, error)
+	FindDevicesForLun(targetIqn string, portals []string, lun int) ([]string, error)
 }
 
 type deviceHandler struct {
