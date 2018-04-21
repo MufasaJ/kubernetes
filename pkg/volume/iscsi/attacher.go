@@ -214,7 +214,8 @@ func volumeSpecToUnmounter(mounter mount.Interface, host volume.VolumeHost) *isc
 		iscsiDisk: &iscsiDisk{
 			plugin: &iscsiPlugin{},
 		},
-		mounter: mounter,
-		exec:    exec,
+		mounter:    mounter,
+		exec:       exec,
+		deviceUtil: volumeutil.NewDeviceHandler(volumeutil.NewIOHandler()),
 	}
 }

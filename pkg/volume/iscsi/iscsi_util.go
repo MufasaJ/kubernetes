@@ -34,6 +34,7 @@ import (
 	"k8s.io/kubernetes/pkg/volume"
 	volumeutil "k8s.io/kubernetes/pkg/volume/util"
 	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
+	"strconv"
 )
 
 var (
@@ -334,6 +335,7 @@ func (util *ISCSIUtil) AttachDisk(b iscsiDiskMounter) (string, error) {
 			break
 		}
 	}
+
 	glog.V(5).Infof("iscsi: AttachDisk devicePath: %s", devicePath)
 	// run global mount path related operations based on volumeMode
 	return globalPDPathOperation(b)(b, devicePath, util)
@@ -394,6 +396,66 @@ func globalPDPathOperation(b iscsiDiskMounter) func(iscsiDiskMounter, string, *I
 	}
 }
 
+// Delete 1 block device of the form "sd*"
+func deleteDevice(deviceName string) error {
+	filename := fmt.Sprintf("/sys/block/%s/device/delete", deviceName)
+	fd, err := os.OpenFile(filename, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer fd.Close()
+
+	if written, err := fd.WriteString("1"); err != nil {
+		return err
+	} else if 0 == written {
+		return fmt.Errorf("No data written to file: %s", filename)
+	}
+	glog.V(4).Infof("Deleted block device: %s", deviceName)
+	return nil
+}
+
+// deleteDevices tries to remove all the block devices and multipath map devices
+// associated with a given iscsi device
+func deleteDevices(c iscsiDiskUnmounter) error {
+	lunNumber, err := strconv.Atoi(c.iscsiDisk.Lun)
+	if nil != err {
+		glog.Errorf("iscsi delete devices: lun is not a number: %s\nError: %v", c.iscsiDisk.Lun, err)
+		return err
+	}
+	// Enumerate the devices so we can delete them
+	deviceNames, err := c.deviceUtil.FindDevicesForLun(c.iscsiDisk.Iqn, lunNumber)
+	if nil != err {
+		glog.Errorf("iscsi delete devices: could not get devices associated with LUN: %s\nError: %v", err)
+		return err
+	}
+	// Find the multipath device path(s)
+	mpathDevices := make(map[string]bool)
+	for _, deviceName := range deviceNames {
+		path := "/dev/" + deviceName
+		// check if the dev is using mpio and if so mount it via the dm-XX device
+		if mappedDevicePath := c.deviceUtil.FindMultipathDeviceForDevice(path); mappedDevicePath != "" {
+			mpathDevices[mappedDevicePath] = true
+		}
+	}
+	// Flush any multipath device maps
+	for mpathDevice := range mpathDevices {
+		_, err = c.exec.Run("multipath", "-f", mpathDevice)
+		if err != nil {
+			glog.Warningf("Warning: Failed to flush multipath device map: %s\nError: %v", mpathDevice, err)
+			// Fall through -- keep deleting the block devices
+		}
+		glog.V(4).Infof("Flushed multipath device: %s", mpathDevice)
+	}
+	for _, deviceName := range deviceNames {
+		err = deleteDevice(deviceName)
+		if err != nil {
+			glog.Warningf("Warning: Failed to delete block device: %s\nError: %v", deviceName, err)
+			// Fall through -- keep deleting other block devices
+		}
+	}
+	return nil
+}
+
 // DetachDisk unmounts and detaches a volume from node
 func (util *ISCSIUtil) DetachDisk(c iscsiDiskUnmounter, mntPath string) error {
 	_, cnt, err := mount.GetDeviceNameFromMount(c.mounter, mntPath)
@@ -411,18 +473,9 @@ func (util *ISCSIUtil) DetachDisk(c iscsiDiskUnmounter, mntPath string) error {
 		glog.Errorf("iscsi detach disk: failed to unmount: %s\nError: %v", mntPath, err)
 		return err
 	}
-	cnt--
-	if cnt != 0 {
-		return nil
-	}
-	// if device is no longer used, see if need to logout the target
 	device, prefix, err := extractDeviceAndPrefix(mntPath)
 	if err != nil {
 		return err
-	}
-	refCount, err := getDevicePrefixRefCount(c.mounter, prefix)
-	if err != nil || refCount != 0 {
-		return nil
 	}
 
 	var bkpPortal []string
@@ -447,6 +500,22 @@ func (util *ISCSIUtil) DetachDisk(c iscsiDiskUnmounter, mntPath string) error {
 		// Logout may fail as no session may exist for the portal/IQN on the specified interface.
 		iface, found = extractIface(mntPath)
 	}
+
+	// Delete all the scsi devices and any multipath devices after unmounting
+	if err = deleteDevices(c); err != nil {
+		glog.Warningf("iscsi detach disk: failed to delete devices\nError: %v", err)
+		// Fall through -- even if deleting fails, a logout may fix problems
+	}
+	cnt--
+	if cnt != 0 {
+		return nil
+	}
+	// if device is no longer used, see if need to logout the target
+	refCount, err := getDevicePrefixRefCount(c.mounter, prefix)
+	if err != nil || refCount != 0 {
+		return nil
+	}
+
 	portals := removeDuplicate(bkpPortal)
 	if len(portals) == 0 {
 		return fmt.Errorf("iscsi detach disk: failed to detach iscsi disk. Couldn't get connected portals from configurations")

@@ -176,8 +176,9 @@ func (plugin *iscsiPlugin) newUnmounterInternal(volName string, podUID types.UID
 			plugin:          plugin,
 			MetricsProvider: volume.NewMetricsStatFS(plugin.host.GetPodVolumeDir(podUID, utilstrings.EscapeQualifiedNameForDisk(iscsiPluginName), volName)),
 		},
-		mounter: mounter,
-		exec:    exec,
+		mounter:    mounter,
+		exec:       exec,
+		deviceUtil: ioutil.NewDeviceHandler(ioutil.NewIOHandler()),
 	}, nil
 }
 
@@ -337,8 +338,9 @@ func (b *iscsiDiskMounter) SetUpAt(dir string, fsGroup *int64) error {
 
 type iscsiDiskUnmounter struct {
 	*iscsiDisk
-	mounter mount.Interface
-	exec    mount.Exec
+	mounter    mount.Interface
+	exec       mount.Exec
+	deviceUtil ioutil.DeviceUtil
 }
 
 var _ volume.Unmounter = &iscsiDiskUnmounter{}
