@@ -213,6 +213,26 @@ func (util *ISCSIUtil) loadISCSI(conf *iscsiDisk, mnt string) error {
 	return nil
 }
 
+// scanLun scans a single LUN on one SCSI bus
+func scanLun(hostNumber int, lunNumber int) error {
+	filename := fmt.Sprintf("/sys/class/scsi_host/host%d/scan", hostNumber)
+	fd, err := os.OpenFile(filename, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer fd.Close()
+
+	scanCmd := fmt.Sprintf("0 0 %d", lunNumber)
+	if written, err := fd.WriteString(scanCmd); err != nil {
+		return err
+	} else if 0 == written {
+		return fmt.Errorf("No data written to file: %s", filename)
+	}
+
+	glog.V(3).Infof("Scanned SCSI host %d LUN %d", hostNumber, lunNumber)
+	return nil
+}
+
 // AttachDisk returns devicePath of volume if attach succeeded otherwise returns error
 func (util *ISCSIUtil) AttachDisk(b iscsiDiskMounter) (string, error) {
 	var devicePath string
@@ -243,12 +263,79 @@ func (util *ISCSIUtil) AttachDisk(b iscsiDiskMounter) (string, error) {
 		b.Iface = newIface
 	}
 
+	// Build a map of SCSI hosts for each target portal. We will need this to
+	// issue the bus rescans.
+	portalHostMap, err := b.deviceUtil.GetIscsiPortalHostMapForTarget(b.Iqn)
+	if nil != err {
+		return "", err
+	}
+	glog.V(6).Infof("AttachDisk portal->host map for %s is %v", b.Iqn, portalHostMap)
+
 	for _, tp := range bkpPortal {
-		// Rescan sessions to discover newly mapped LUNs. Do not specify the interface when rescanning
-		// to avoid establishing additional sessions to the same target.
-		out, err := b.exec.Run("iscsiadm", "-m", "node", "-p", tp, "-T", b.Iqn, "-R")
-		if err != nil {
-			glog.Errorf("iscsi: failed to rescan session with error: %s (%v)", string(out), err)
+		hostNumber, loggedIn := portalHostMap[tp]
+		if !loggedIn {
+			glog.V(4).Infof("Could not get SCSI host number for portal %s, will attempt login", tp)
+
+			// build discoverydb and discover iscsi target
+			b.exec.Run("iscsiadm", "-m", "discoverydb", "-t", "sendtargets", "-p", tp, "-I", b.Iface, "-o", "new")
+			// update discoverydb with CHAP secret
+			err = updateISCSIDiscoverydb(b, tp)
+			if err != nil {
+				lastErr = fmt.Errorf("iscsi: failed to update discoverydb to portal %s error: %v", tp, err)
+				continue
+			}
+			out, err = b.exec.Run("iscsiadm", "-m", "discoverydb", "-t", "sendtargets", "-p", tp, "-I", b.Iface, "--discover")
+			if err != nil {
+				// delete discoverydb record
+				b.exec.Run("iscsiadm", "-m", "discoverydb", "-t", "sendtargets", "-p", tp, "-I", b.Iface, "-o", "delete")
+				lastErr = fmt.Errorf("iscsi: failed to sendtargets to portal %s output: %s, err %v", tp, string(out), err)
+				continue
+			}
+			err = updateISCSINode(b, tp)
+			if err != nil {
+				// failure to update node db is rare. But deleting record will likely impact those who already start using it.
+				lastErr = fmt.Errorf("iscsi: failed to update iscsi node to portal %s error: %v", tp, err)
+				continue
+			}
+			// login to iscsi target
+			out, err = b.exec.Run("iscsiadm", "-m", "node", "-p", tp, "-T", b.Iqn, "-I", b.Iface, "--login")
+			if err != nil {
+				// delete the node record from database
+				b.exec.Run("iscsiadm", "-m", "node", "-p", tp, "-I", b.Iface, "-T", b.Iqn, "-o", "delete")
+				lastErr = fmt.Errorf("iscsi: failed to attach disk: Error: %s (%v)", string(out), err)
+				continue
+			}
+			// in case of node failure/restart, explicitly set to manual login so it doesn't hang on boot
+			out, err = b.exec.Run("iscsiadm", "-m", "node", "-p", tp, "-T", b.Iqn, "-o", "update", "-n", "node.startup", "-v", "manual")
+			if err != nil {
+				// don't fail if we can't set startup mode, but log warning so there is a clue
+				glog.Warningf("Warning: Failed to set iSCSI login mode to manual. Error: %v", err)
+			}
+
+			// Rebuild the host map after logging in
+			portalHostMap, err := b.deviceUtil.GetIscsiPortalHostMapForTarget(b.Iqn)
+			if nil != err {
+				return "", err
+			}
+			glog.V(6).Infof("AttachDisk portal->host map for %s is %v", b.Iqn, portalHostMap)
+
+			hostNumber, loggedIn = portalHostMap[tp]
+			if !loggedIn {
+				glog.Warningf("Could not get SCSI host number for portal %s after logging in", tp)
+				continue
+			}
+		}
+
+		glog.V(5).Infof("AttachDisk: scanning SCSI host %d LUN %s", hostNumber, b.Lun)
+		lunNumber, err := strconv.Atoi(b.Lun)
+		if nil != err {
+			return "", fmt.Errorf("AttachDisk: lun is not a number: %s\nError: %v", b.Lun, err)
+		}
+
+		// Scan the iSCSI bus for the LUN
+		err = scanLun(hostNumber, lunNumber)
+		if nil != err {
+			return "", err
 		}
 
 		if iscsiTransport == "" {
@@ -261,46 +348,6 @@ func (util *ISCSIUtil) AttachDisk(b iscsiDiskMounter) (string, error) {
 			devicePath = strings.Join([]string{"/dev/disk/by-path/pci", "*", "ip", tp, "iscsi", b.Iqn, "lun", b.Lun}, "-")
 		}
 
-		if exist := waitForPathToExist(&devicePath, 1, iscsiTransport); exist {
-			glog.V(4).Infof("iscsi: devicepath (%s) exists", devicePath)
-			devicePaths = append(devicePaths, devicePath)
-			continue
-		}
-		// build discoverydb and discover iscsi target
-		b.exec.Run("iscsiadm", "-m", "discoverydb", "-t", "sendtargets", "-p", tp, "-I", b.Iface, "-o", "new")
-		// update discoverydb with CHAP secret
-		err = updateISCSIDiscoverydb(b, tp)
-		if err != nil {
-			lastErr = fmt.Errorf("iscsi: failed to update discoverydb to portal %s error: %v", tp, err)
-			continue
-		}
-		out, err = b.exec.Run("iscsiadm", "-m", "discoverydb", "-t", "sendtargets", "-p", tp, "-I", b.Iface, "--discover")
-		if err != nil {
-			// delete discoverydb record
-			b.exec.Run("iscsiadm", "-m", "discoverydb", "-t", "sendtargets", "-p", tp, "-I", b.Iface, "-o", "delete")
-			lastErr = fmt.Errorf("iscsi: failed to sendtargets to portal %s output: %s, err %v", tp, string(out), err)
-			continue
-		}
-		err = updateISCSINode(b, tp)
-		if err != nil {
-			// failure to update node db is rare. But deleting record will likely impact those who already start using it.
-			lastErr = fmt.Errorf("iscsi: failed to update iscsi node to portal %s error: %v", tp, err)
-			continue
-		}
-		// login to iscsi target
-		out, err = b.exec.Run("iscsiadm", "-m", "node", "-p", tp, "-T", b.Iqn, "-I", b.Iface, "--login")
-		if err != nil {
-			// delete the node record from database
-			b.exec.Run("iscsiadm", "-m", "node", "-p", tp, "-I", b.Iface, "-T", b.Iqn, "-o", "delete")
-			lastErr = fmt.Errorf("iscsi: failed to attach disk: Error: %s (%v)", string(out), err)
-			continue
-		}
-		// in case of node failure/restart, explicitly set to manual login so it doesn't hang on boot
-		out, err = b.exec.Run("iscsiadm", "-m", "node", "-p", tp, "-T", b.Iqn, "-o", "update", "node.startup", "-v", "manual")
-		if err != nil {
-			// don't fail if we can't set startup mode, but log warning so there is a clue
-			glog.Warningf("Warning: Failed to set iSCSI login mode to manual. Error: %v", err)
-		}
 		if exist := waitForPathToExist(&devicePath, 10, iscsiTransport); !exist {
 			glog.Errorf("Could not attach disk: Timeout after 10s")
 			// update last error

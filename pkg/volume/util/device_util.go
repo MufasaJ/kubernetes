@@ -20,6 +20,7 @@ package util
 type DeviceUtil interface {
 	FindMultipathDeviceForDevice(disk string) string
 	FindSlaveDevicesOnMultipath(disk string) []string
+	GetIscsiPortalHostMapForTarget(targetIqn string) (map[string]int, error)
 	FindDevicesForLun(targetIqn string, lun int) ([]string, error)
 }
 
